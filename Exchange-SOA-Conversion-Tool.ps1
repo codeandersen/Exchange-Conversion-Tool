@@ -2,37 +2,27 @@
 
 <#
         .SYNOPSIS
-        Exchange SOA Conversion Tool - Combined Source of Authority management for Exchange users, Groups and Contacts
+        Exchange SOA Conversion Tool - Source of Authority management for Exchange mailboxes
 
         .DESCRIPTION
-        GUI tool to manage Source of Authority (SOA) conversion for:
-          - Exchange mailboxes (IsDirSynced users) via ExchangeOnlineManagement
-          - Mail-enabled Security Groups and Distribution Groups via Microsoft Graph
-          - Org Contacts (mail contacts) via Microsoft Graph
+        GUI tool to manage Source of Authority (SOA) conversion for Exchange mailboxes
+        (IsDirSynced users) via ExchangeOnlineManagement.
 
         Features:
-        - Three tabs: Users, Groups, Contacts
         - Live search by display name or email address across all loaded data
-        - Per-tab Hide Converted filter
+        - Hide Converted filter
         - Pagination (100 per page)
         - Batch conversion with confirmation
-        - Nested group detection and bottom-up conversion ordering (Groups tab)
         - Full logging to a single session log file
-
-        .PARAMETER TenantId
-        Optional. The Entra ID tenant ID (GUID). Recommended in multi-tenant / partner scenarios.
 
         .EXAMPLE
         .\Exchange-SOA-Conversion-Tool.ps1
-        .\Exchange-SOA-Conversion-Tool.ps1 -TenantId "00000000-0000-0000-0000-000000000000"
 
         .NOTES
-        Version: 1.00
+        Version: 1.10
 
         .LINK
         https://learn.microsoft.com/en-us/exchange/hybrid-deployment/enable-exchange-attributes-cloud-management
-        https://learn.microsoft.com/en-us/entra/identity/hybrid/how-to-group-source-of-authority-configure
-        https://learn.microsoft.com/en-us/entra/identity/hybrid/how-to-user-source-of-authority-configure#configure-contact-soa
 
         .COPYRIGHT
         MIT License, feel free to distribute and use as you like, please leave author information.
@@ -44,13 +34,7 @@
         This script is provided AS-IS, with no warranty - Use at own risk.
     #>
 
-param(
-    [Parameter(Mandatory=$false, HelpMessage="Enter the Entra ID tenant ID (GUID) to connect to.")]
-    [string]$TenantId
-)
-
-$script:Version       = "1.00"
-$script:TenantId      = $TenantId
+$script:Version       = "1.10"
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -58,33 +42,15 @@ Add-Type -AssemblyName System.Drawing
 $script:ScriptPath    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:LogFile       = Join-Path $script:ScriptPath "SOAConversion_$(Get-Date -Format 'yyyyMMdd_HHmm').log"
 
-# ---- Per-tab state ----
-# Users
+# ---- State ----
 $script:AllUsers             = @()
 $script:AllUsersUnfiltered   = @()
 $script:UsersCurrentPage     = 1
 $script:UsersHideConverted   = $false
 $script:UsersSortColumn      = ""
 $script:UsersSortDirection   = "Ascending"
-
-# Groups
-$script:AllGroups            = @()
-$script:AllGroupsUnfiltered  = @()
-$script:GroupsCurrentPage    = 1
-$script:GroupsHideConverted  = $false
-$script:GroupsSortColumn     = ""
-$script:GroupsSortDirection  = "Ascending"
-$script:PermissionOk         = $false
-$script:NestingMap           = @{}
-$script:NestingDepth         = @{}
-
-# Contacts
-$script:AllContacts           = @()
-$script:AllContactsUnfiltered = @()
-$script:ContactsCurrentPage   = 1
-$script:ContactsHideConverted = $false
-$script:ContactsSortColumn    = ""
-$script:ContactsSortDirection = "Ascending"
+$script:ExoConnected         = $false
+$script:ExoModuleLoaded      = $false
 
 $script:PageSize = 100
 
@@ -209,70 +175,144 @@ function Add-DgvTextColumn {
 # MODULE / CONNECTION CHECKS
 # ==============================================================================
 
-function Test-ExchangeModule {
-    $module = Get-Module -ListAvailable -Name ExchangeOnlineManagement
-    if (-not $module) {
-        Write-Log "ExchangeOnlineManagement module not found. Attempting install..." -Level WARNING
-        try {
-            [System.Windows.Forms.MessageBox]::Show(
-                "ExchangeOnlineManagement module is not installed.`nThe tool will now attempt to install it.",
-                "Module Required", [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Information)
-            Install-Module -Name ExchangeOnlineManagement -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
-            Write-Log "ExchangeOnlineManagement installed successfully."
-            return $true
-        } catch {
-            Write-Log "Failed to install ExchangeOnlineManagement: $($_.Exception.Message)" -Level ERROR
-            [System.Windows.Forms.MessageBox]::Show(
-                "Failed to install ExchangeOnlineManagement.`n`nError: $($_.Exception.Message)`n`nInstall manually:`nInstall-Module -Name ExchangeOnlineManagement -Scope CurrentUser",
-                "Installation Failed", [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Error)
-            return $false
-        }
+function Add-ModulePathIfMissing {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    $existing = $env:PSModulePath -split ';' | ForEach-Object { $_.TrimEnd('\') }
+    if ($existing -notcontains $Path.TrimEnd('\')) {
+        $env:PSModulePath = "$env:PSModulePath;$Path"
+        Write-Log "Added '$Path' to PSModulePath for this session."
     }
-    Write-Log "ExchangeOnlineManagement found (v$($module.Version))."
-    return $true
 }
 
-function Test-GraphModule {
-    $module = Get-Module -ListAvailable -Name Microsoft.Graph.Groups
-    if (-not $module) {
-        Write-Log "Microsoft.Graph.Groups module not found. Attempting install..." -Level WARNING
-        try {
-            [System.Windows.Forms.MessageBox]::Show(
-                "Microsoft.Graph.Groups module is not installed.`nThe tool will now attempt to install it.",
-                "Module Required", [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Information)
-            Install-Module -Name Microsoft.Graph.Groups -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
-            Write-Log "Microsoft.Graph.Groups installed successfully."
-            return $true
-        } catch {
-            Write-Log "Failed to install Microsoft.Graph.Groups: $($_.Exception.Message)" -Level ERROR
-            [System.Windows.Forms.MessageBox]::Show(
-                "Failed to install Microsoft.Graph.Groups.`n`nError: $($_.Exception.Message)`n`nInstall manually:`nInstall-Module -Name Microsoft.Graph.Groups -Scope CurrentUser",
-                "Installation Failed", [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Error)
-            return $false
+function Import-ExchangeModule {
+    Write-Log "PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))"
+
+    $psg = Get-Module -ListAvailable -Name PowerShellGet | Sort-Object Version -Descending | Select-Object -First 1
+    if ($psg) { Write-Log "PowerShellGet v$($psg.Version)" } else { Write-Log "PowerShellGet module not found." -Level WARNING }
+
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        $userModuleDir     = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'PowerShell\Modules'
+        $allUsersModuleDir = "$env:ProgramFiles\PowerShell\Modules"
+    } else {
+        $userModuleDir     = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'WindowsPowerShell\Modules'
+        $allUsersModuleDir = "$env:ProgramFiles\WindowsPowerShell\Modules"
+    }
+    Add-ModulePathIfMissing $userModuleDir
+    Add-ModulePathIfMissing $allUsersModuleDir
+    Write-Log "PSModulePath: $env:PSModulePath"
+
+    $dotNetTooOld = $false
+    if ($PSVersionTable.PSEdition -ne 'Core') {
+        $rel = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' -ErrorAction SilentlyContinue).Release
+        Write-Log ".NET Framework release: $rel"
+        if ($null -eq $rel -or $rel -lt 461808) {
+            $dotNetTooOld = $true
+            Write-Log ".NET Framework 4.7.2 or later is required for the EXO v3 module." -Level WARNING
         }
     }
-    Write-Log "Microsoft.Graph.Groups found (v$($module.Version))."
-    return $true
+
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $installScope = if ($isAdmin) { 'AllUsers' } else { 'CurrentUser' }
+    Write-Log "Elevated: $isAdmin  -  install scope: $installScope"
+
+    $script:ExoImportTried = @()
+
+    $tryImport = {
+        param([array]$Modules)
+        foreach ($m in $Modules) {
+            try {
+                Import-Module -Name $m.Path -Force -DisableNameChecking -ErrorAction Stop
+                Write-Log "Imported ExchangeOnlineManagement v$($m.Version) from '$($m.Path)'."
+                return $true
+            } catch {
+                $script:ExoImportTried += "$($m.Path)  -  $($_.Exception.Message)"
+                Write-Log "Failed to import ExchangeOnlineManagement from '$($m.Path)': $($_.Exception.Message)" -Level WARNING
+            }
+        }
+        return $false
+    }
+
+    $getExoModules = {
+        $found = @(Get-Module -ListAvailable -Name ExchangeOnlineManagement |
+                   Sort-Object @{ Expression = 'Version'; Descending = $true },
+                               @{ Expression = { $_.ModuleBase -like "$env:ProgramFiles*" }; Descending = $true })
+        if ($found.Count -eq 0) {
+            Get-InstalledModule -Name ExchangeOnlineManagement -AllVersions -ErrorAction SilentlyContinue | ForEach-Object {
+                Write-Log "Get-InstalledModule found ExchangeOnlineManagement v$($_.Version) at '$($_.InstalledLocation)'."
+                $psd1 = Join-Path $_.InstalledLocation 'ExchangeOnlineManagement.psd1'
+                if (Test-Path $psd1) {
+                    $found += [PSCustomObject]@{ Path = $psd1; Version = $_.Version; ModuleBase = $_.InstalledLocation }
+                }
+            }
+        }
+        return $found
+    }
+
+    $mods = @(& $getExoModules)
+    if ($mods.Count -eq 0) {
+        Write-Log "ExchangeOnlineManagement module not found." -Level WARNING
+    } else {
+        foreach ($m in $mods) { Write-Log "Found ExchangeOnlineManagement v$($m.Version) at '$($m.ModuleBase)'." }
+        if (& $tryImport $mods) { return [bool]$true }
+        Write-Log "No installed version of ExchangeOnlineManagement could be imported." -Level WARNING
+    }
+
+    $answer = [System.Windows.Forms.MessageBox]::Show(
+        "The ExchangeOnlineManagement module is not available or could not be loaded.`n`nReinstall it now ($installScope scope)?",
+        "Module Required", [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Question)
+    if ($answer -eq [System.Windows.Forms.DialogResult]::Yes) {
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue | Where-Object { $_.Version -ge [version]'2.8.5.201' })) {
+                Write-Log "Installing NuGet package provider ($installScope scope)..."
+                Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope $installScope -Force -ErrorAction Stop | Out-Null
+            }
+            Write-Log "Installing ExchangeOnlineManagement ($installScope scope)..."
+            Install-Module -Name ExchangeOnlineManagement -Scope $installScope -Force -AllowClobber -ErrorAction Stop | Out-Null
+            Write-Log "ExchangeOnlineManagement installed successfully."
+        } catch {
+            Write-Log "Failed to install ExchangeOnlineManagement: $($_.Exception.Message)" -Level ERROR
+        }
+
+        $mods = @(& $getExoModules)
+        foreach ($m in $mods) { Write-Log "Found ExchangeOnlineManagement v$($m.Version) at '$($m.ModuleBase)'." }
+        if (& $tryImport $mods) { return [bool]$true }
+    }
+
+    Write-Log "ExchangeOnlineManagement could not be loaded. Paths tried: $($script:ExoImportTried -join ' | ')" -Level ERROR
+    $triedText = if ($script:ExoImportTried.Count -gt 0) { "`n`nPaths tried:`n" + ($script:ExoImportTried -join "`n") } else { "" }
+    $netNote   = if ($dotNetTooOld) { "`n`nNote: the EXO module requires .NET Framework 4.7.2 or later.`nInstall .NET Framework 4.7.2 or later (4.8 recommended)." } else { "" }
+    [void][System.Windows.Forms.MessageBox]::Show(
+        "ExchangeOnlineManagement could not be loaded.$triedText$netNote`n`nFix manually:`n  Uninstall-Module ExchangeOnlineManagement -AllVersions -Force`n  Install-Module ExchangeOnlineManagement -Scope $installScope -Force",
+        "Module Load Failed", [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error)
+    return [bool]$false
 }
 
 # ==============================================================================
-# USERS TAB -- BACKEND
+# USERS -- BACKEND
 # ==============================================================================
 
 function Connect-EXOSession {
     Write-Log "Connecting to Exchange Online..."
     try {
-        Import-Module ExchangeOnlineManagement -ErrorAction Stop
-        Connect-ExchangeOnline -ErrorAction Stop -ShowBanner:$false
+        $connectParams = @{ ShowBanner = $false; ErrorAction = 'Stop' }
+        if ((Get-Command Connect-ExchangeOnline).Parameters.ContainsKey('DisableWAM')) {
+            $connectParams['DisableWAM'] = $true
+            Write-Log "Using browser-based sign-in (WAM disabled)."
+        }
+        # Clear the WinForms SynchronizationContext so MSAL's async sign-in doesn't deadlock the UI thread.
+        $prevSyncContext = [System.Threading.SynchronizationContext]::Current
+        [System.Threading.SynchronizationContext]::SetSynchronizationContext($null)
+        try { Connect-ExchangeOnline @connectParams }
+        finally { [System.Threading.SynchronizationContext]::SetSynchronizationContext($prevSyncContext) }
         Write-Log "Connected to Exchange Online."
         return $true
     } catch {
         Write-Log "EXO connect failed: $($_.Exception.Message)" -Level ERROR
-        [System.Windows.Forms.MessageBox]::Show(
+        [void][System.Windows.Forms.MessageBox]::Show(
             "Failed to connect to Exchange Online.`n`nError: $($_.Exception.Message)",
             "Connection Failed", [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Error)
@@ -282,16 +322,34 @@ function Connect-EXOSession {
 
 function Get-ExchangeUsers {
     Write-Log "Retrieving mailboxes from Exchange Online..."
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        $all = Get-Mailbox -ResultSize Unlimited -ErrorAction Stop |
-               Select-Object DisplayName, PrimarySmtpAddress, IsExchangeCloudManaged, UserPrincipalName, IsDirSynced
-        Write-Log "Retrieved $($all.Count) total mailboxes."
-        $hybrid = $all | Where-Object { $_.IsDirSynced -eq $true }
-        Write-Log "Filtered to $($hybrid.Count) IsDirSynced mailboxes."
-        return @($hybrid)
+        $list  = New-Object System.Collections.Generic.List[object]
+        $total = 0
+        Update-Busy "Requesting mailboxes from Exchange Online (first results can take a while)..."
+        Get-Mailbox -ResultSize Unlimited -ErrorAction Stop | ForEach-Object {
+            $total++
+            if ($_.IsDirSynced -eq $true) {
+                $list.Add([PSCustomObject]@{
+                    DisplayName             = $_.DisplayName
+                    PrimarySmtpAddress      = [string]$_.PrimarySmtpAddress
+                    IsExchangeCloudManaged  = $_.IsExchangeCloudManaged
+                    UserPrincipalName       = $_.UserPrincipalName
+                    IsDirSynced             = $_.IsDirSynced
+                })
+            }
+            if ($total % 25 -eq 0) {
+                Update-Busy "Loading mailboxes... $total retrieved, $($list.Count) directory-synced"
+            }
+        }
+        $watch.Stop()
+        Write-Log "Retrieved $total total mailboxes in $([int]$watch.Elapsed.TotalSeconds)s."
+        Write-Log "Filtered to $($list.Count) IsDirSynced mailboxes."
+        return ,$list.ToArray()
     } catch {
+        $watch.Stop()
         Write-Log "Failed to retrieve mailboxes: $($_.Exception.Message)" -Level ERROR
-        [System.Windows.Forms.MessageBox]::Show(
+        [void][System.Windows.Forms.MessageBox]::Show(
             "Failed to retrieve mailboxes.`n`nError: $($_.Exception.Message)",
             "Retrieval Failed", [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Error)
@@ -299,12 +357,35 @@ function Get-ExchangeUsers {
     }
 }
 
+function Backup-MailboxAttributes {
+    param($User)
+    $mbx  = Get-Mailbox -Identity $User.UserPrincipalName -ErrorAction Stop
+    $name = $User.DisplayName
+    Write-Log "User '$name' - Alias (mailNickname): $($mbx.Alias)"
+    Write-Log "User '$name' - Primary SMTP: $($mbx.PrimarySmtpAddress)"
+    Write-Log "User '$name' - All Email Addresses: $(@($mbx.EmailAddresses) -join '; ')"
+    Write-Log "User '$name' - HiddenFromAddressListsEnabled: $($mbx.HiddenFromAddressListsEnabled)"
+    $custom = @()
+    foreach ($n in 1..15) {
+        $v = $mbx."CustomAttribute$n"
+        if (-not [string]::IsNullOrWhiteSpace([string]$v)) { $custom += "CustomAttribute$n=$v" }
+    }
+    foreach ($n in 1..5) {
+        $v = @($mbx."ExtensionCustomAttribute$n") -join ','
+        if (-not [string]::IsNullOrWhiteSpace($v)) { $custom += "ExtensionCustomAttribute$n=$v" }
+    }
+    $customText = if ($custom.Count -gt 0) { $custom -join '; ' } else { 'None set' }
+    Write-Log "User '$name' - Custom Attributes: $customText"
+    return [string]$mbx.PrimarySmtpAddress
+}
+
 function Convert-UserToCloud {
     param($User)
-    Write-Log "Converting user '$($User.DisplayName)' to Cloud Managed..."
+    Write-Log "Converting user '$($User.DisplayName)' ($($User.UserPrincipalName)) to Cloud Managed..."
     try {
+        $smtp = Backup-MailboxAttributes -User $User
         Set-Mailbox -Identity $User.UserPrincipalName -IsExchangeCloudManaged $true -ErrorAction Stop
-        Write-Log "Converted '$($User.DisplayName)' to Cloud Managed." -Level INFO
+        Write-Log "Successfully converted user '$($User.DisplayName)' ($smtp) to Cloud Managed." -Level INFO
         return $true
     } catch {
         Write-Log "Failed to convert '$($User.DisplayName)': $($_.Exception.Message)" -Level ERROR
@@ -314,317 +395,14 @@ function Convert-UserToCloud {
 
 function Convert-UserToOnPrem {
     param($User)
-    Write-Log "Converting user '$($User.DisplayName)' to On-Prem Managed..."
+    Write-Log "Converting user '$($User.DisplayName)' ($($User.UserPrincipalName)) to On-Prem Managed..."
     try {
+        $smtp = Backup-MailboxAttributes -User $User
         Set-Mailbox -Identity $User.UserPrincipalName -IsExchangeCloudManaged $false -ErrorAction Stop
-        Write-Log "Converted '$($User.DisplayName)' to On-Prem Managed." -Level INFO
+        Write-Log "Successfully converted user '$($User.DisplayName)' ($smtp) to On-Prem Managed." -Level INFO
         return $true
     } catch {
         Write-Log "Failed to roll back '$($User.DisplayName)': $($_.Exception.Message)" -Level ERROR
-        return $false
-    }
-}
-
-# ==============================================================================
-# GROUPS TAB -- BACKEND
-# ==============================================================================
-
-function Test-GraphGroupPermission {
-    try {
-        $ctx = Get-MgContext
-        if (-not $ctx) { $script:PermissionOk = $false; return $false }
-        if ($ctx.Scopes -contains 'Group-OnPremisesSyncBehavior.ReadWrite.All') {
-            $script:PermissionOk = $true; return $true
-        }
-        $script:PermissionOk = $false; return $false
-    } catch {
-        $script:PermissionOk = $false; return $false
-    }
-}
-
-function Connect-GraphSession {
-    $tenantMsg = if ($script:TenantId) { "TenantId: $($script:TenantId)" } else { "default tenant" }
-    Write-Log "Connecting to Microsoft Graph ($tenantMsg)..."
-    try {
-        # Remove any previously loaded Microsoft.Graph modules to avoid assembly-version conflicts
-        # (common when multiple versions are installed side-by-side).
-        Get-Module 'Microsoft.Graph.*' | Remove-Module -Force -ErrorAction SilentlyContinue
-
-        $graphModule = Get-Module -ListAvailable -Name Microsoft.Graph.Groups |
-                       Sort-Object Version -Descending | Select-Object -First 1
-        if (-not $graphModule) { throw "Microsoft.Graph.Groups module is not available." }
-        $graphVersion = $graphModule.Version
-        Write-Log "Importing Microsoft.Graph modules version $graphVersion..."
-        Import-Module Microsoft.Graph.Authentication -RequiredVersion $graphVersion -Force -ErrorAction Stop
-        Import-Module Microsoft.Graph.Groups      -RequiredVersion $graphVersion -Force -ErrorAction Stop
-        Import-Module Microsoft.Graph.Identity.DirectoryManagement -RequiredVersion $graphVersion -Force -ErrorAction SilentlyContinue
-
-        $scopes = @(
-            'Group.ReadWrite.All',
-            'Group-OnPremisesSyncBehavior.ReadWrite.All',
-            'OrgContact.Read.All',
-            'Contacts-OnPremisesSyncBehavior.ReadWrite.All'
-        )
-        $connectParams = @{ Scopes = $scopes; ErrorAction = 'Stop'; NoWelcome = $true }
-        if ($script:TenantId) { $connectParams['TenantId'] = $script:TenantId }
-
-        Connect-MgGraph @connectParams
-
-        $ctx = Get-MgContext
-        Write-Log "Connected to Graph. TenantId: $($ctx.TenantId)"
-
-        if (-not (Test-GraphGroupPermission)) {
-            Write-Log "Permission missing -- triggering consent re-flow..." -Level WARNING
-            Disconnect-MgGraph -ErrorAction SilentlyContinue
-            Connect-MgGraph @connectParams
-            if (-not (Test-GraphGroupPermission)) {
-                Write-Log "Required permission still not granted after consent." -Level WARNING
-                [System.Windows.Forms.MessageBox]::Show(
-                    "The permission 'Group-OnPremisesSyncBehavior.ReadWrite.All' was not granted.`n`nThis may require admin consent.`n`nTo grant manually:`n1. Entra admin center`n2. Enterprise Applications`n3. 'Microsoft Graph Command Line Tools'`n4. Permissions -> Grant admin consent",
-                    "Permission Not Granted", [System.Windows.Forms.MessageBoxButtons]::OK,
-                    [System.Windows.Forms.MessageBoxIcon]::Warning)
-            }
-        }
-        return $true
-    } catch {
-        Write-Log "Graph connect failed: $($_.Exception.Message)" -Level ERROR
-        [System.Windows.Forms.MessageBox]::Show(
-            "Failed to connect to Microsoft Graph.`n`nError: $($_.Exception.Message)",
-            "Connection Failed", [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Error)
-        return $false
-    }
-}
-
-function Get-ExchangeGroups {
-    param($StatusLabelRef)
-    Write-Log "Retrieving Exchange-relevant groups from Graph..."
-    try {
-        $allGroups = Get-MgGroup -All -Property Id,DisplayName,Mail,MailEnabled,SecurityEnabled,GroupTypes,OnPremisesSyncEnabled -ErrorAction Stop
-        Write-Log "Retrieved $($allGroups.Count) total groups."
-
-        $exchangeGroups = $allGroups | Where-Object {
-            $_.MailEnabled -eq $true -and
-            ($null -eq $_.GroupTypes -or $_.GroupTypes.Count -eq 0 -or $_.GroupTypes -notcontains "Unified")
-        }
-        Write-Log "Filtered to $($exchangeGroups.Count) Exchange-relevant groups."
-
-        $results = @()
-        $total   = $exchangeGroups.Count
-        $idx     = 0
-
-        foreach ($group in $exchangeGroups) {
-            $idx++
-            if ($idx % 10 -eq 0 -or $idx -eq $total) {
-                if ($StatusLabelRef) { $StatusLabelRef.Text = "Loading group $idx of $total..." }
-                [System.Windows.Forms.Application]::DoEvents()
-            }
-
-            $groupType    = if ($group.SecurityEnabled) { "Mail-Enabled Security Group" } else { "Distribution Group" }
-            $isCloud      = $null
-            for ($r = 0; $r -lt 3; $r++) {
-                try {
-                    $uri = "https://graph.microsoft.com/v1.0/groups/$($group.Id)/onPremisesSyncBehavior?`$select=isCloudManaged"
-                    $resp = Invoke-MgGraphRequest -Uri $uri -Method GET -ErrorAction Stop
-                    $isCloud = if ($null -ne $resp.isCloudManaged) { [bool]$resp.isCloudManaged } else { "Unknown" }
-                    break
-                } catch {
-                    if ($r -lt 2) { Start-Sleep -Milliseconds 500 }
-                    else          { $isCloud = "Unknown" }
-                }
-            }
-
-            $results += [PSCustomObject]@{
-                Id             = $group.Id
-                DisplayName    = $group.DisplayName
-                Mail           = $group.Mail
-                GroupType      = $groupType
-                IsCloudManaged = $isCloud
-                SecurityEnabled = $group.SecurityEnabled
-                MailEnabled    = $group.MailEnabled
-            }
-        }
-        Write-Log "Finished loading SOA status for $($results.Count) groups."
-        return $results
-    } catch {
-        Write-Log "Failed to retrieve groups: $($_.Exception.Message)" -Level ERROR
-        [System.Windows.Forms.MessageBox]::Show(
-            "Failed to retrieve groups.`n`nError: $($_.Exception.Message)",
-            "Retrieval Failed", [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Error)
-        return $null
-    }
-}
-
-function Build-NestingMap {
-    param([array]$Groups, $StatusLabelRef)
-    Write-Log "Building nested group map..."
-    $script:NestingMap   = @{}
-    $script:NestingDepth = @{}
-    $groupIds = @{}
-    foreach ($g in $Groups) { $groupIds[$g.Id] = $g; $script:NestingMap[$g.Id] = @() }
-
-    $total = $Groups.Count; $idx = 0
-    foreach ($g in $Groups) {
-        $idx++
-        if ($idx % 10 -eq 0 -or $idx -eq $total) {
-            if ($StatusLabelRef) { $StatusLabelRef.Text = "Analyzing nesting $idx of $total..." }
-            [System.Windows.Forms.Application]::DoEvents()
-        }
-        try {
-            $members = Get-MgGroupMember -GroupId $g.Id -All -Property Id -ErrorAction Stop
-            foreach ($m in $members) {
-                if ($groupIds.ContainsKey($m.Id)) { $script:NestingMap[$g.Id] += $m.Id }
-            }
-        } catch {
-            Write-Log "Could not retrieve members for '$($g.DisplayName)': $($_.Exception.Message)" -Level WARNING
-        }
-    }
-
-    foreach ($g in $Groups) { $script:NestingDepth[$g.Id] = 0 }
-    $changed = $true; $iter = 0
-    while ($changed -and $iter -lt 100) {
-        $changed = $false; $iter++
-        foreach ($parentId in $script:NestingMap.Keys) {
-            foreach ($cid in $script:NestingMap[$parentId]) {
-                $exp = $script:NestingDepth[$cid] + 1
-                if ($exp -gt $script:NestingDepth[$parentId]) { $script:NestingDepth[$parentId] = $exp; $changed = $true }
-            }
-        }
-    }
-    $maxDepth = ($script:NestingDepth.Values | Measure-Object -Maximum).Maximum
-    Write-Log "Nesting analysis complete. Max depth: $maxDepth."
-}
-
-function Get-UnconvertedChildren {
-    param([string]$GroupId)
-    $unconverted = @()
-    if ($script:NestingMap.ContainsKey($GroupId)) {
-        foreach ($cid in $script:NestingMap[$GroupId]) {
-            $child = $script:AllGroups | Where-Object { $_.Id -eq $cid }
-            if ($child -and $child.IsCloudManaged -ne $true) { $unconverted += $child }
-        }
-    }
-    return $unconverted
-}
-
-function Convert-GroupToCloud {
-    param($Group)
-    Write-Log "Converting group '$($Group.DisplayName)' to Cloud Managed..."
-    try {
-        $body = @{ isCloudManaged = $true } | ConvertTo-Json
-        Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/groups/$($Group.Id)/onPremisesSyncBehavior" -Method PATCH -Body $body -ContentType "application/json" -ErrorAction Stop
-        Write-Log "Converted group '$($Group.DisplayName)'." -Level INFO
-        return $true
-    } catch {
-        Write-Log "Failed to convert group '$($Group.DisplayName)': $($_.Exception.Message)" -Level ERROR
-        return $false
-    }
-}
-
-function Convert-GroupToOnPrem {
-    param($Group)
-    Write-Log "Rolling back group '$($Group.DisplayName)' to On-Prem..."
-    try {
-        $body = @{ isCloudManaged = $false } | ConvertTo-Json
-        Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/groups/$($Group.Id)/onPremisesSyncBehavior" -Method PATCH -Body $body -ContentType "application/json" -ErrorAction Stop
-        Write-Log "Rolled back group '$($Group.DisplayName)'." -Level INFO
-        return $true
-    } catch {
-        Write-Log "Failed to roll back group '$($Group.DisplayName)': $($_.Exception.Message)" -Level ERROR
-        return $false
-    }
-}
-
-# ==============================================================================
-# CONTACTS TAB -- BACKEND
-# ==============================================================================
-
-function Get-OrgContacts {
-    param($StatusLabelRef)
-    Write-Log "Retrieving org contacts from Graph..."
-    try {
-        $allContacts = Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/contacts?`$select=id,displayName,mail,onPremisesSyncEnabled&`$top=999" -Method GET -ErrorAction Stop
-        $contacts = [System.Collections.Generic.List[object]]::new()
-        $page = $allContacts
-        while ($page) {
-            foreach ($c in $page.value) { $contacts.Add($c) }
-            if ($page.'@odata.nextLink') {
-                $page = Invoke-MgGraphRequest -Uri $page.'@odata.nextLink' -Method GET -ErrorAction Stop
-            } else { break }
-        }
-        Write-Log "Retrieved $($contacts.Count) org contacts."
-
-        $results = @()
-        $total   = $contacts.Count
-        $idx     = 0
-
-        foreach ($contact in $contacts) {
-            $idx++
-            if ($idx % 20 -eq 0 -or $idx -eq $total) {
-                if ($StatusLabelRef) { $StatusLabelRef.Text = "Loading contact $idx of $total..." }
-                [System.Windows.Forms.Application]::DoEvents()
-            }
-
-            $isCloud = "N/A"
-            if ($contact.onPremisesSyncEnabled -eq $true) {
-                for ($r = 0; $r -lt 3; $r++) {
-                    try {
-                        $uri  = "https://graph.microsoft.com/v1.0/contacts/$($contact.id)/onPremisesSyncBehavior?`$select=isCloudManaged"
-                        $resp = Invoke-MgGraphRequest -Uri $uri -Method GET -ErrorAction Stop
-                        $isCloud = if ($null -ne $resp.isCloudManaged) { [bool]$resp.isCloudManaged } else { "Unknown" }
-                        break
-                    } catch {
-                        if ($r -lt 2) { Start-Sleep -Milliseconds 300 }
-                        else          { $isCloud = "Unknown" }
-                    }
-                }
-            }
-
-            $results += [PSCustomObject]@{
-                Id                   = $contact.id
-                DisplayName          = $contact.displayName
-                Mail                 = $contact.mail
-                OnPremisesSyncEnabled = $contact.onPremisesSyncEnabled
-                IsCloudManaged       = $isCloud
-            }
-        }
-        Write-Log "Finished loading SOA status for $($results.Count) contacts."
-        return $results
-    } catch {
-        Write-Log "Failed to retrieve org contacts: $($_.Exception.Message)" -Level ERROR
-        [System.Windows.Forms.MessageBox]::Show(
-            "Failed to retrieve org contacts.`n`nError: $($_.Exception.Message)`n`nNote: 'Contacts-OnPremisesSyncBehavior.ReadWrite.All' may require admin consent.",
-            "Retrieval Failed", [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Error)
-        return $null
-    }
-}
-
-function Convert-ContactToCloud {
-    param($Contact)
-    Write-Log "Converting contact '$($Contact.DisplayName)' to Cloud Managed..."
-    try {
-        $body = @{ isCloudManaged = $true } | ConvertTo-Json
-        Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/contacts/$($Contact.Id)/onPremisesSyncBehavior" -Method PATCH -Body $body -ContentType "application/json" -ErrorAction Stop
-        Write-Log "Converted contact '$($Contact.DisplayName)'." -Level INFO
-        return $true
-    } catch {
-        Write-Log "Failed to convert contact '$($Contact.DisplayName)': $($_.Exception.Message)" -Level ERROR
-        return $false
-    }
-}
-
-function Convert-ContactToOnPrem {
-    param($Contact)
-    Write-Log "Rolling back contact '$($Contact.DisplayName)' to On-Prem..."
-    try {
-        $body = @{ isCloudManaged = $false } | ConvertTo-Json
-        Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/contacts/$($Contact.Id)/onPremisesSyncBehavior" -Method PATCH -Body $body -ContentType "application/json" -ErrorAction Stop
-        Write-Log "Rolled back contact '$($Contact.DisplayName)'." -Level INFO
-        return $true
-    } catch {
-        Write-Log "Failed to roll back contact '$($Contact.DisplayName)': $($_.Exception.Message)" -Level ERROR
         return $false
     }
 }
@@ -633,11 +411,9 @@ Write-Log "========================================"
 Write-Log "Exchange SOA Conversion Tool v$script:Version Started"
 Write-Log "========================================"
 
-if (-not (Test-ExchangeModule)) {
-    Write-Log "ExchangeOnlineManagement module missing. Users tab may not function." -Level WARNING
-}
-if (-not (Test-GraphModule)) {
-    Write-Log "Microsoft.Graph.Groups module missing. Groups/Contacts tabs may not function." -Level WARNING
+$script:ExoModuleLoaded = Import-ExchangeModule
+if (-not $script:ExoModuleLoaded) {
+    Write-Log "ExchangeOnlineManagement module not loaded. Connect will be disabled." -Level WARNING
 }
 
 # ==============================================================================
@@ -676,7 +452,7 @@ $headerPanel.Controls.Add($labelTitle)
 $labelDesc = New-Object System.Windows.Forms.Label
 $labelDesc.Location  = New-Object System.Drawing.Point(20, 55)
 $labelDesc.Size      = New-Object System.Drawing.Size(900, 22)
-$labelDesc.Text      = "Manage Source of Authority for Exchange mailboxes, Groups, and Contacts"
+$labelDesc.Text      = "Manage Source of Authority for Exchange mailboxes"
 $labelDesc.Font      = New-Object System.Drawing.Font("Segoe UI", 9)
 $labelDesc.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#605E5C")
 $labelDesc.BackColor = [System.Drawing.Color]::Transparent
@@ -701,26 +477,8 @@ if (Test-Path $logoPath) {
 }
 $headerPanel.Controls.Add($pictureBoxLogo)
 
-# --- TabControl ---
-$tabControl = New-Object System.Windows.Forms.TabControl
-$tabControl.Font = New-Object System.Drawing.Font("Segoe UI", 10)
-$tabControl.Padding = New-Object System.Drawing.Point(12, 4)
-$tabControl.Dock = [System.Windows.Forms.DockStyle]::Fill
-
-# Add the Fill control first, then the Top-docked header, so docking resolves
-# correctly (the header claims the top edge, the tab control fills the rest).
-$form.Controls.Add($tabControl)
-$form.Controls.Add($headerPanel)
-
-$tabUsers    = New-Object System.Windows.Forms.TabPage; $tabUsers.Text    = "  Users (Mailboxes)  ";    $tabUsers.BackColor    = [System.Drawing.ColorTranslator]::FromHtml("#F3F3F3")
-$tabGroups   = New-Object System.Windows.Forms.TabPage; $tabGroups.Text   = "  Groups  ";               $tabGroups.BackColor   = [System.Drawing.ColorTranslator]::FromHtml("#F3F3F3")
-$tabContacts = New-Object System.Windows.Forms.TabPage; $tabContacts.Text = "  Contacts  ";             $tabContacts.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#F3F3F3")
-$tabControl.TabPages.Add($tabUsers)
-$tabControl.TabPages.Add($tabGroups)
-$tabControl.TabPages.Add($tabContacts)
-
 # ==============================================================================
-# USERS TAB -- GUI
+# USERS -- GUI
 # ==============================================================================
 
 $uToolbar = New-Object System.Windows.Forms.Panel
@@ -793,8 +551,8 @@ $uActionPanel.Height    = 52
 $uActionPanel.Dock      = [System.Windows.Forms.DockStyle]::Bottom
 $uActionPanel.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#F3F3F3")
 
-$uBtnToCloud  = New-StyledButton -Text "Convert to Cloud Managed"   -X 0   -Y 4 -Width 220 -Height 40
-$uBtnToOnPrem = New-StyledButton -Text "Convert to On-Prem Managed" -X 228 -Y 4 -Width 230 -Height 40
+$uBtnToCloud  = New-StyledButton -Text "Convert to Cloud Managed"   -X 0   -Y 4 -Width 220 -Height 40 -Enabled $false
+$uBtnToOnPrem = New-StyledButton -Text "Convert to On-Prem Managed" -X 228 -Y 4 -Width 230 -Height 40 -Enabled $false
 $uBtnOpenLog  = New-StyledButton -Text "Open Log"                   -X 466 -Y 4 -Width 120 -Height 40
 
 $uStatusLabel = New-Object System.Windows.Forms.Label
@@ -822,11 +580,65 @@ $uActionPanel.Add_SizeChanged({
     $uVersionLabel.Location = New-Object System.Drawing.Point([Math]::Max(0, $w - $uVersionLabel.Width), 30)
 })
 
-# Dock order: Fill grid first, then bottom panels (action outermost, pagination above), then top toolbar.
-$tabUsers.Controls.Add($uGrid)
-$tabUsers.Controls.Add($uActionPanel)
-$tabUsers.Controls.Add($uPaginPanel)
-$tabUsers.Controls.Add($uToolbar)
+$uProgress = New-Object System.Windows.Forms.ProgressBar
+$uProgress.Height = 6
+$uProgress.Dock   = [System.Windows.Forms.DockStyle]::Top
+$uProgress.Visible = $false
+$uProgress.MarqueeAnimationSpeed = 30
+
+# Dock order: Fill grid first, then bottom panels (action outermost, pagination
+# above), then top-docked progress bar + toolbar, then the header last so it
+# claims the top edge.
+$form.Controls.Add($uGrid)
+$form.Controls.Add($uActionPanel)
+$form.Controls.Add($uPaginPanel)
+$form.Controls.Add($uProgress)
+$form.Controls.Add($uToolbar)
+$form.Controls.Add($headerPanel)
+
+if (-not $script:ExoModuleLoaded) {
+    $uBtnConnect.Enabled = $false
+    $uStatusLabel.Text   = "ExchangeOnlineManagement not loaded - see log"
+}
+
+# ---- Busy-state helpers ----
+function Start-Busy {
+    param([string]$Text, [int]$Maximum = 0)
+    $script:BusyWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    if ($Maximum -gt 0) {
+        $uProgress.Style    = [System.Windows.Forms.ProgressBarStyle]::Continuous
+        $uProgress.Minimum  = 0
+        $uProgress.Maximum  = $Maximum
+        $uProgress.Value    = 0
+    } else {
+        $uProgress.Style    = [System.Windows.Forms.ProgressBarStyle]::Marquee
+    }
+    $uProgress.Visible   = $true
+    $form.UseWaitCursor  = $true
+    $uSearchBox.Enabled  = $false
+    $uChkHide.Enabled    = $false
+    $uStatusLabel.Text   = $Text
+    $uStatusLabel.Refresh()
+    [System.Windows.Forms.Application]::DoEvents()
+}
+
+function Update-Busy {
+    param([string]$Text, [int]$Value = -1)
+    if ($Value -ge 0 -and $uProgress.Style -eq [System.Windows.Forms.ProgressBarStyle]::Continuous) {
+        $uProgress.Value = [Math]::Min($Value, $uProgress.Maximum)
+    }
+    $uStatusLabel.Text = "$Text  ($([int]$script:BusyWatch.Elapsed.TotalSeconds)s)"
+    $uStatusLabel.Refresh()
+    [System.Windows.Forms.Application]::DoEvents()
+}
+
+function Stop-Busy {
+    $uProgress.Visible  = $false
+    $form.UseWaitCursor = $false
+    $uSearchBox.Enabled = $true
+    $uChkHide.Enabled   = $true
+    if ($script:BusyWatch) { $script:BusyWatch.Stop() }
+}
 
 # ---- Users grid update helper ----
 function Update-UserGrid {
@@ -838,10 +650,11 @@ function Update-UserGrid {
         -EmailPropertyName   "PrimarySmtpAddress"
 
     if ($script:UsersSortColumn -ne "") {
+        $sortProp = if ($script:UsersSortColumn -eq "Email") { "PrimarySmtpAddress" } else { $script:UsersSortColumn }
         $display = if ($script:UsersSortDirection -eq "Ascending") {
-            $display | Sort-Object -Property $script:UsersSortColumn
+            $display | Sort-Object -Property $sortProp
         } else {
-            $display | Sort-Object -Property $script:UsersSortColumn -Descending
+            $display | Sort-Object -Property $sortProp -Descending
         }
     }
 
@@ -872,36 +685,59 @@ function Update-UserGrid {
 
 # ---- Users event wiring ----
 $uBtnConnect.Add_Click({
-    $uBtnConnect.Enabled = $false
-    if (Connect-EXOSession) {
-        $uBtnConnect.Text     = "Connected"
-        $uBtnConnect.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#107C10")
-        $uBtnRefresh.Enabled    = $true
-        $uBtnDisconnect.Enabled = $true
-        $uStatusLabel.Text = "Loading mailboxes..."
-        $users = Get-ExchangeUsers
-        if ($users) {
-            $script:AllUsersUnfiltered = $users
-            $script:UsersCurrentPage   = 1
-            Update-UserGrid
-            $uStatusLabel.Text = "Connected  -  $($users.Count) mailboxes loaded"
-        } else { $uStatusLabel.Text = "Connected but failed to load users" }
-    } else {
-        $uBtnConnect.Enabled = $true
+    $uBtnConnect.Enabled    = $false
+    $uBtnRefresh.Enabled    = $false
+    $uBtnDisconnect.Enabled = $false
+    $uBtnToCloud.Enabled    = $false
+    $uBtnToOnPrem.Enabled   = $false
+    try {
+        Start-Busy "Waiting for sign-in..."
+        if (Connect-EXOSession) {
+            $script:ExoConnected   = $true
+            $uBtnConnect.Text      = "Connected"
+            $uBtnConnect.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#107C10")
+            Update-Busy "Loading mailboxes..."
+            $users = Get-ExchangeUsers
+            if ($null -ne $users) {
+                $script:AllUsersUnfiltered = $users
+                $script:UsersCurrentPage   = 1
+                Update-UserGrid
+                $uStatusLabel.Text = "Connected  -  $($users.Count) mailboxes loaded"
+            } else { $uStatusLabel.Text = "Connected but failed to load users" }
+        }
+    } finally {
+        Stop-Busy
+        $uBtnConnect.Enabled    = (-not $script:ExoConnected) -and $script:ExoModuleLoaded
+        $uBtnRefresh.Enabled    = $script:ExoConnected
+        $uBtnDisconnect.Enabled = $script:ExoConnected
+        $uBtnToCloud.Enabled    = $script:ExoConnected
+        $uBtnToOnPrem.Enabled   = $script:ExoConnected
     }
 })
 
 $uBtnRefresh.Add_Click({
-    $uBtnRefresh.Enabled = $false
-    $uStatusLabel.Text = "Refreshing..."
-    $users = Get-ExchangeUsers
-    if ($users) {
-        $script:AllUsersUnfiltered = $users
-        $script:UsersCurrentPage   = 1
-        Update-UserGrid
-        $uStatusLabel.Text = "Refreshed  -  $($users.Count) mailboxes loaded"
+    $uBtnConnect.Enabled    = $false
+    $uBtnRefresh.Enabled    = $false
+    $uBtnDisconnect.Enabled = $false
+    $uBtnToCloud.Enabled    = $false
+    $uBtnToOnPrem.Enabled   = $false
+    try {
+        Start-Busy "Refreshing mailboxes..."
+        $users = Get-ExchangeUsers
+        if ($null -ne $users) {
+            $script:AllUsersUnfiltered = $users
+            $script:UsersCurrentPage   = 1
+            Update-UserGrid
+            $uStatusLabel.Text = "Refreshed  -  $($users.Count) mailboxes loaded"
+        } else { $uStatusLabel.Text = "Refresh failed - see log" }
+    } finally {
+        Stop-Busy
+        $uBtnConnect.Enabled    = (-not $script:ExoConnected) -and $script:ExoModuleLoaded
+        $uBtnRefresh.Enabled    = $script:ExoConnected
+        $uBtnDisconnect.Enabled = $script:ExoConnected
+        $uBtnToCloud.Enabled    = $script:ExoConnected
+        $uBtnToOnPrem.Enabled   = $script:ExoConnected
     }
-    $uBtnRefresh.Enabled = $true
 })
 
 $uBtnDisconnect.Add_Click({
@@ -911,17 +747,20 @@ $uBtnDisconnect.Add_Click({
     } catch {
         Write-Log "Disconnect warning: $($_.Exception.Message)" -Level WARNING
     }
+    $script:ExoConnected    = $false
     $uBtnConnect.Text      = "Connect to EXO"
     $uBtnConnect.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#0078D4")
-    $uBtnConnect.Enabled   = $true
+    $uBtnConnect.Enabled   = $script:ExoModuleLoaded
     $uBtnRefresh.Enabled   = $false
     $uBtnDisconnect.Enabled = $false
+    $uBtnToCloud.Enabled    = $false
+    $uBtnToOnPrem.Enabled   = $false
     $script:AllUsersUnfiltered = @()
     $script:AllUsers           = @()
     $uGrid.Rows.Clear()
     $uPageInfo.Text    = "No users loaded"
     $uStatusLabel.Text = "Disconnected"
-    [System.Windows.Forms.MessageBox]::Show("Disconnected from Exchange Online.", "Disconnected",
+    [void][System.Windows.Forms.MessageBox]::Show("Disconnected from Exchange Online.", "Disconnected",
         [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
 })
 
@@ -960,7 +799,7 @@ $uGrid.Add_ColumnHeaderMouseClick({
 
 $uBtnToCloud.Add_Click({
     if ($uGrid.SelectedRows.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("Please select at least one user.", "No Selection",
+        [void][System.Windows.Forms.MessageBox]::Show("Please select at least one user.", "No Selection",
             [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
         return
     }
@@ -970,25 +809,43 @@ $uBtnToCloud.Add_Click({
     if ([System.Windows.Forms.MessageBox]::Show($msg, "Confirm", [System.Windows.Forms.MessageBoxButtons]::YesNo,
         [System.Windows.Forms.MessageBoxIcon]::Question) -ne [System.Windows.Forms.DialogResult]::Yes) { return }
 
-    $ok = 0; $fail = 0
-    foreach ($row in $uGrid.SelectedRows) {
-        $u = @{ DisplayName = $row.Cells["DisplayName"].Value; UserPrincipalName = $row.Cells["UserPrincipalName"].Value }
-        if (Convert-UserToCloud -User $u) {
-            $row.Cells["IsExchangeCloudManaged"].Value = "True"
-            $match = $script:AllUsersUnfiltered | Where-Object { $_.UserPrincipalName -eq $u.UserPrincipalName }
-            if ($match) { $match.IsExchangeCloudManaged = $true }
-            $ok++
-        } else { $fail++ }
+    $uBtnConnect.Enabled    = $false
+    $uBtnRefresh.Enabled    = $false
+    $uBtnDisconnect.Enabled = $false
+    $uBtnToCloud.Enabled    = $false
+    $uBtnToOnPrem.Enabled   = $false
+    Start-Busy "Converting..." -Maximum $cnt
+    try {
+        $ok = 0; $fail = 0; $i = 0
+        foreach ($row in $uGrid.SelectedRows) {
+            $i++
+            $u = @{ DisplayName = $row.Cells["DisplayName"].Value; UserPrincipalName = $row.Cells["UserPrincipalName"].Value }
+            Update-Busy "Converting $i of $cnt : $($u.DisplayName)" -Value $i
+            if (Convert-UserToCloud -User $u) {
+                $row.Cells["IsExchangeCloudManaged"].Value = "True"
+                $match = $script:AllUsersUnfiltered | Where-Object { $_.UserPrincipalName -eq $u.UserPrincipalName }
+                if ($match) { $match.IsExchangeCloudManaged = $true }
+                $ok++
+            } else { $fail++ }
+        }
+        Stop-Busy
+        [void][System.Windows.Forms.MessageBox]::Show("Done.`n`nConverted: $ok`nFailed: $fail", "Batch Complete",
+            [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+        $uStatusLabel.Text = "Converted: $ok  Failed: $fail"
+        Update-UserGrid
+    } finally {
+        Stop-Busy
+        $uBtnConnect.Enabled    = (-not $script:ExoConnected) -and $script:ExoModuleLoaded
+        $uBtnRefresh.Enabled    = $script:ExoConnected
+        $uBtnDisconnect.Enabled = $script:ExoConnected
+        $uBtnToCloud.Enabled    = $script:ExoConnected
+        $uBtnToOnPrem.Enabled   = $script:ExoConnected
     }
-    [System.Windows.Forms.MessageBox]::Show("Done.`n`nConverted: $ok`nFailed: $fail", "Batch Complete",
-        [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
-    $uStatusLabel.Text = "Converted: $ok  Failed: $fail"
-    Update-UserGrid
 })
 
 $uBtnToOnPrem.Add_Click({
     if ($uGrid.SelectedRows.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("Please select at least one user.", "No Selection",
+        [void][System.Windows.Forms.MessageBox]::Show("Please select at least one user.", "No Selection",
             [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
         return
     }
@@ -998,762 +855,43 @@ $uBtnToOnPrem.Add_Click({
     if ([System.Windows.Forms.MessageBox]::Show($msg, "Confirm", [System.Windows.Forms.MessageBoxButtons]::YesNo,
         [System.Windows.Forms.MessageBoxIcon]::Question) -ne [System.Windows.Forms.DialogResult]::Yes) { return }
 
-    $ok = 0; $fail = 0
-    foreach ($row in $uGrid.SelectedRows) {
-        $u = @{ DisplayName = $row.Cells["DisplayName"].Value; UserPrincipalName = $row.Cells["UserPrincipalName"].Value }
-        if (Convert-UserToOnPrem -User $u) {
-            $row.Cells["IsExchangeCloudManaged"].Value = "False"
-            $match = $script:AllUsersUnfiltered | Where-Object { $_.UserPrincipalName -eq $u.UserPrincipalName }
-            if ($match) { $match.IsExchangeCloudManaged = $false }
-            $ok++
-        } else { $fail++ }
+    $uBtnConnect.Enabled    = $false
+    $uBtnRefresh.Enabled    = $false
+    $uBtnDisconnect.Enabled = $false
+    $uBtnToCloud.Enabled    = $false
+    $uBtnToOnPrem.Enabled   = $false
+    Start-Busy "Rolling back..." -Maximum $cnt
+    try {
+        $ok = 0; $fail = 0; $i = 0
+        foreach ($row in $uGrid.SelectedRows) {
+            $i++
+            $u = @{ DisplayName = $row.Cells["DisplayName"].Value; UserPrincipalName = $row.Cells["UserPrincipalName"].Value }
+            Update-Busy "Rolling back $i of $cnt : $($u.DisplayName)" -Value $i
+            if (Convert-UserToOnPrem -User $u) {
+                $row.Cells["IsExchangeCloudManaged"].Value = "False"
+                $match = $script:AllUsersUnfiltered | Where-Object { $_.UserPrincipalName -eq $u.UserPrincipalName }
+                if ($match) { $match.IsExchangeCloudManaged = $false }
+                $ok++
+            } else { $fail++ }
+        }
+        Stop-Busy
+        [void][System.Windows.Forms.MessageBox]::Show("Done.`n`nRolled back: $ok`nFailed: $fail", "Batch Complete",
+            [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+        $uStatusLabel.Text = "Rolled back: $ok  Failed: $fail"
+        Update-UserGrid
+    } finally {
+        Stop-Busy
+        $uBtnConnect.Enabled    = (-not $script:ExoConnected) -and $script:ExoModuleLoaded
+        $uBtnRefresh.Enabled    = $script:ExoConnected
+        $uBtnDisconnect.Enabled = $script:ExoConnected
+        $uBtnToCloud.Enabled    = $script:ExoConnected
+        $uBtnToOnPrem.Enabled   = $script:ExoConnected
     }
-    [System.Windows.Forms.MessageBox]::Show("Done.`n`nRolled back: $ok`nFailed: $fail", "Batch Complete",
-        [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
-    $uStatusLabel.Text = "Rolled back: $ok  Failed: $fail"
-    Update-UserGrid
 })
 
 $uBtnOpenLog.Add_Click({
     if (Test-Path $script:LogFile) { Start-Process notepad.exe -ArgumentList $script:LogFile }
-    else { [System.Windows.Forms.MessageBox]::Show("Log file not found yet.", "Log", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) }
-})
-
-# ==============================================================================
-# GROUPS TAB -- GUI
-# ==============================================================================
-
-$gToolbar = New-Object System.Windows.Forms.Panel
-$gToolbar.Height    = 52
-$gToolbar.Dock      = [System.Windows.Forms.DockStyle]::Top
-$gToolbar.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#F3F3F3")
-
-$gBtnConnect    = New-StyledButton -Text "Connect to Graph"  -X 5   -Y 7 -Width 155 -Height 36 -BackHex "#0078D4" -ForeHex "#FFFFFF"
-$gBtnRefresh    = New-StyledButton -Text "Refresh"           -X 168 -Y 7 -Width 110 -Height 36 -Enabled $false
-$gBtnDisconnect = New-StyledButton -Text "Disconnect"        -X 286 -Y 7 -Width 120 -Height 36 -Enabled $false
-
-$gSearchLabel = New-Object System.Windows.Forms.Label
-$gSearchLabel.Location  = New-Object System.Drawing.Point(420, 14)
-$gSearchLabel.Size      = New-Object System.Drawing.Size(55, 22)
-$gSearchLabel.Text      = "Search:"
-$gSearchLabel.Font      = New-Object System.Drawing.Font("Segoe UI", 9)
-$gSearchLabel.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#1F1F1F")
-
-$gSearchBox = New-Object System.Windows.Forms.TextBox
-$gSearchBox.Location    = New-Object System.Drawing.Point(478, 11)
-$gSearchBox.Size        = New-Object System.Drawing.Size(240, 26)
-$gSearchBox.Font        = New-Object System.Drawing.Font("Segoe UI", 9)
-$gSearchBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
-
-$gChkHide = New-Object System.Windows.Forms.CheckBox
-$gChkHide.Location  = New-Object System.Drawing.Point(730, 14)
-$gChkHide.Size      = New-Object System.Drawing.Size(205, 24)
-$gChkHide.Text      = "Hide Converted Groups"
-$gChkHide.Font      = New-Object System.Drawing.Font("Segoe UI", 9)
-$gChkHide.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#1F1F1F")
-
-$gToolbar.Controls.AddRange(@($gBtnConnect, $gBtnRefresh, $gBtnDisconnect, $gSearchLabel, $gSearchBox, $gChkHide))
-
-$gGrid = New-DataGrid
-$gGrid.Dock = [System.Windows.Forms.DockStyle]::Fill
-Add-DgvTextColumn $gGrid "DisplayName"    "Display Name"   26
-Add-DgvTextColumn $gGrid "Email"          "Email Address"  26
-Add-DgvTextColumn $gGrid "GroupType"      "Group Type"     20
-Add-DgvTextColumn $gGrid "IsCloudManaged" "Cloud Managed"  12
-Add-DgvTextColumn $gGrid "NestingDepth"   "Nesting Depth"  10
-Add-DgvTextColumn $gGrid "ObjectId"       "Object ID"      0  $false
-
-$gPaginPanel = New-Object System.Windows.Forms.Panel
-$gPaginPanel.Height    = 36
-$gPaginPanel.Dock      = [System.Windows.Forms.DockStyle]::Bottom
-$gPaginPanel.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#F3F3F3")
-
-$gBtnPrev = New-StyledButton -Text "< Previous" -X 0 -Y 1 -Width 100 -Height 28 -Enabled $false
-$gBtnPrev.Anchor = [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Bottom
-
-$gPageInfo = New-Object System.Windows.Forms.Label
-$gPageInfo.Location  = New-Object System.Drawing.Point(108, 6)
-$gPageInfo.Size      = New-Object System.Drawing.Size(700, 22)
-$gPageInfo.Text      = "No groups loaded"
-$gPageInfo.Font      = New-Object System.Drawing.Font("Segoe UI", 9)
-$gPageInfo.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#605E5C")
-$gPageInfo.Anchor    = [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Bottom
-
-$gBtnNext = New-StyledButton -Text "Next >" -X 1006 -Y 1 -Width 100 -Height 28 -Enabled $false
-$gBtnNext.Anchor = [System.Windows.Forms.AnchorStyles]::Right -bor [System.Windows.Forms.AnchorStyles]::Bottom
-
-$gPaginPanel.Controls.AddRange(@($gBtnPrev, $gPageInfo, $gBtnNext))
-$gPaginPanel.Add_SizeChanged({
-    $w = $gPaginPanel.ClientSize.Width
-    $gBtnNext.Location  = New-Object System.Drawing.Point(($w - $gBtnNext.Width), 1)
-    $gPageInfo.Location = New-Object System.Drawing.Point(108, 6)
-    $gPageInfo.Size     = New-Object System.Drawing.Size([Math]::Max(50, $w - 108 - $gBtnNext.Width - 10), 22)
-})
-
-$gActionPanel = New-Object System.Windows.Forms.Panel
-$gActionPanel.Height    = 52
-$gActionPanel.Dock      = [System.Windows.Forms.DockStyle]::Bottom
-$gActionPanel.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#F3F3F3")
-
-$gBtnToCloud  = New-StyledButton -Text "Convert to Cloud Managed"   -X 0   -Y 4 -Width 220 -Height 40
-$gBtnToOnPrem = New-StyledButton -Text "Roll Back to On-Prem"       -X 228 -Y 4 -Width 200 -Height 40
-$gBtnOpenLog2 = New-StyledButton -Text "Open Log"                   -X 436 -Y 4 -Width 120 -Height 40
-
-$gStatusLabel = New-Object System.Windows.Forms.Label
-$gStatusLabel.Location  = New-Object System.Drawing.Point(570, 12)
-$gStatusLabel.Size      = New-Object System.Drawing.Size(530, 22)
-$gStatusLabel.Text      = "Not connected"
-$gStatusLabel.Font      = New-Object System.Drawing.Font("Segoe UI", 9)
-$gStatusLabel.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#605E5C")
-$gStatusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
-$gStatusLabel.Anchor    = [System.Windows.Forms.AnchorStyles]::Right -bor [System.Windows.Forms.AnchorStyles]::Bottom
-
-$gVersionLabel = New-Object System.Windows.Forms.Label
-$gVersionLabel.Location  = New-Object System.Drawing.Point(570, 34)
-$gVersionLabel.Size      = New-Object System.Drawing.Size(530, 18)
-$gVersionLabel.Text      = "Version $script:Version"
-$gVersionLabel.Font      = New-Object System.Drawing.Font("Segoe UI", 8)
-$gVersionLabel.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#808080")
-$gVersionLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
-$gVersionLabel.Anchor    = [System.Windows.Forms.AnchorStyles]::Right -bor [System.Windows.Forms.AnchorStyles]::Bottom
-
-$gActionPanel.Controls.AddRange(@($gBtnToCloud, $gBtnToOnPrem, $gBtnOpenLog2, $gStatusLabel, $gVersionLabel))
-$gActionPanel.Add_SizeChanged({
-    $w = $gActionPanel.ClientSize.Width
-    $gStatusLabel.Location  = New-Object System.Drawing.Point([Math]::Max(0, $w - $gStatusLabel.Width), 6)
-    $gVersionLabel.Location = New-Object System.Drawing.Point([Math]::Max(0, $w - $gVersionLabel.Width), 30)
-})
-
-# Dock order: Fill grid first, then bottom panels (action outermost, pagination above), then top toolbar.
-$tabGroups.Controls.Add($gGrid)
-$tabGroups.Controls.Add($gActionPanel)
-$tabGroups.Controls.Add($gPaginPanel)
-$tabGroups.Controls.Add($gToolbar)
-
-# ---- Groups grid update helper ----
-function Update-GroupGrid {
-    $display = Get-FilteredData `
-        -Source                $script:AllGroupsUnfiltered `
-        -SearchText            $gSearchBox.Text `
-        -HideConverted         $script:GroupsHideConverted `
-        -ConvertedPropertyName "IsCloudManaged" `
-        -EmailPropertyName     "Mail"
-
-    if ($script:GroupsSortColumn -ne "") {
-        $sortProp = $script:GroupsSortColumn
-        $display = if ($script:GroupsSortDirection -eq "Ascending") {
-            if ($sortProp -eq "NestingDepth") {
-                $display | Sort-Object { if ($script:NestingDepth.ContainsKey($_.Id)) { $script:NestingDepth[$_.Id] } else { 0 } }
-            } else { $display | Sort-Object -Property $sortProp }
-        } else {
-            if ($sortProp -eq "NestingDepth") {
-                $display | Sort-Object { if ($script:NestingDepth.ContainsKey($_.Id)) { $script:NestingDepth[$_.Id] } else { 0 } } -Descending
-            } else { $display | Sort-Object -Property $sortProp -Descending }
-        }
-    }
-
-    $script:AllGroups = @($display)
-    $total      = $script:AllGroups.Count
-    $totalPages = [Math]::Ceiling($total / $script:PageSize)
-    if ($totalPages -lt 1) { $totalPages = 1 }
-    if ($script:GroupsCurrentPage -gt $totalPages) { $script:GroupsCurrentPage = $totalPages }
-    if ($script:GroupsCurrentPage -lt 1)           { $script:GroupsCurrentPage = 1 }
-
-    $startIdx = ($script:GroupsCurrentPage - 1) * $script:PageSize
-    $endIdx   = [Math]::Min($startIdx + $script:PageSize - 1, $total - 1)
-
-    $gGrid.Rows.Clear()
-    if ($total -gt 0) {
-        for ($i = $startIdx; $i -le $endIdx; $i++) {
-            $g     = $script:AllGroups[$i]
-            $depth = if ($script:NestingDepth.ContainsKey($g.Id)) { $script:NestingDepth[$g.Id] } else { 0 }
-            $val   = if ($g.IsCloudManaged -is [string]) { $g.IsCloudManaged } elseif ($g.IsCloudManaged) { "True" } else { "False" }
-            $gGrid.Rows.Add($g.DisplayName, $g.Mail, $g.GroupType, $val, $depth, $g.Id)
-        }
-        $gPageInfo.Text = "Page $($script:GroupsCurrentPage) of $totalPages  -  Showing $($endIdx - $startIdx + 1) of $total groups"
-    } else {
-        $gPageInfo.Text = "No groups to display"
-    }
-    $gBtnPrev.Enabled = ($script:GroupsCurrentPage -gt 1)
-    $gBtnNext.Enabled = ($script:GroupsCurrentPage -lt $totalPages)
-}
-
-# ---- Groups event wiring ----
-$gBtnConnect.Add_Click({
-    $gBtnConnect.Enabled = $false
-    if (Connect-GraphSession) {
-        $ctx = Get-MgContext
-        $form.Text = "Exchange SOA Conversion Tool  -  Tenant: $($ctx.TenantId)"
-        $gBtnConnect.Text      = "Connected"
-        $gBtnConnect.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#107C10")
-        $gBtnRefresh.Enabled    = $true
-        $gBtnDisconnect.Enabled = $true
-        $cBtnConnect.Text      = "Connected (Graph)"
-        $cBtnConnect.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#107C10")
-        $cBtnConnect.Enabled   = $false
-        $cBtnRefresh.Enabled    = $true
-        $cBtnDisconnect.Enabled = $true
-        $gStatusLabel.Text = "Loading groups..."
-        $groups = Get-ExchangeGroups -StatusLabelRef $gStatusLabel
-        if ($groups) {
-            $script:AllGroupsUnfiltered = $groups
-            $gStatusLabel.Text = "Building nesting map..."
-            Build-NestingMap -Groups $groups -StatusLabelRef $gStatusLabel
-            $script:GroupsCurrentPage = 1
-            Update-GroupGrid
-            $gStatusLabel.Text = "Connected  -  $($groups.Count) groups loaded"
-        } else { $gStatusLabel.Text = "Connected but failed to load groups" }
-    } else {
-        $gBtnConnect.Enabled = $true
-    }
-})
-
-$gBtnRefresh.Add_Click({
-    $gBtnRefresh.Enabled = $false
-    $gStatusLabel.Text = "Refreshing..."
-    $groups = Get-ExchangeGroups -StatusLabelRef $gStatusLabel
-    if ($groups) {
-        $script:AllGroupsUnfiltered = $groups
-        $gStatusLabel.Text = "Building nesting map..."
-        Build-NestingMap -Groups $groups -StatusLabelRef $gStatusLabel
-        $script:GroupsCurrentPage = 1
-        Update-GroupGrid
-        $gStatusLabel.Text = "Refreshed  -  $($groups.Count) groups loaded"
-    }
-    $gBtnRefresh.Enabled = $true
-})
-
-$gBtnDisconnect.Add_Click({
-    try { Disconnect-MgGraph -ErrorAction Stop; Write-Log "Disconnected from Graph." }
-    catch { Write-Log "Graph disconnect warning: $($_.Exception.Message)" -Level WARNING }
-    $form.Text = "Exchange SOA Conversion Tool"
-    $gBtnConnect.Text      = "Connect to Graph"
-    $gBtnConnect.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#0078D4")
-    $gBtnConnect.Enabled   = $true
-    $gBtnRefresh.Enabled   = $false
-    $gBtnDisconnect.Enabled = $false
-    $cBtnConnect.Text      = "Connect to Graph"
-    $cBtnConnect.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#0078D4")
-    $cBtnConnect.Enabled   = $true
-    $cBtnRefresh.Enabled   = $false
-    $cBtnDisconnect.Enabled = $false
-    $script:AllGroupsUnfiltered   = @()
-    $script:AllGroups             = @()
-    $script:AllContactsUnfiltered = @()
-    $script:AllContacts           = @()
-    $script:PermissionOk          = $false
-    $gGrid.Rows.Clear(); $cGrid.Rows.Clear()
-    $gPageInfo.Text    = "No groups loaded"
-    $cPageInfo.Text    = "No contacts loaded"
-    $gStatusLabel.Text = "Disconnected"
-    $cStatusLabel.Text = "Disconnected"
-    [System.Windows.Forms.MessageBox]::Show("Disconnected from Microsoft Graph.", "Disconnected",
-        [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
-})
-
-$gSearchBox.Add_TextChanged({
-    $script:GroupsCurrentPage = 1
-    Update-GroupGrid
-})
-
-$gChkHide.Add_CheckedChanged({
-    $script:GroupsHideConverted = $gChkHide.Checked
-    $script:GroupsCurrentPage   = 1
-    Update-GroupGrid
-})
-
-$gBtnPrev.Add_Click({
-    if ($script:GroupsCurrentPage -gt 1) { $script:GroupsCurrentPage--; Update-GroupGrid }
-})
-$gBtnNext.Add_Click({
-    $tp = [Math]::Ceiling($script:AllGroups.Count / $script:PageSize)
-    if ($script:GroupsCurrentPage -lt $tp) { $script:GroupsCurrentPage++; Update-GroupGrid }
-})
-
-$gGrid.Add_ColumnHeaderMouseClick({
-    param($dgv, $e)
-    $col = $dgv.Columns[$e.ColumnIndex].Name
-    if ($col -eq "ObjectId") { return }
-    if ($script:GroupsSortColumn -eq $col) {
-        $script:GroupsSortDirection = if ($script:GroupsSortDirection -eq "Ascending") { "Descending" } else { "Ascending" }
-    } else {
-        $script:GroupsSortColumn    = $col
-        $script:GroupsSortDirection = "Ascending"
-    }
-    $script:GroupsCurrentPage = 1
-    Update-GroupGrid
-})
-
-$gBtnToCloud.Add_Click({
-    if (-not $script:PermissionOk) {
-        [System.Windows.Forms.MessageBox]::Show(
-            "Required permission 'Group-OnPremisesSyncBehavior.ReadWrite.All' is not consented.`nReconnect to Graph to grant it.",
-            "Permission Required", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
-        return
-    }
-    if ($gGrid.SelectedRows.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("Please select at least one group.", "No Selection",
-            [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
-        return
-    }
-
-    $selectedGroups = @()
-    foreach ($row in $gGrid.SelectedRows) {
-        $gid = $row.Cells["ObjectId"].Value
-        $g   = $script:AllGroups | Where-Object { $_.Id -eq $gid }
-        if ($g) { $selectedGroups += $g }
-    }
-
-    $warnings = @()
-    foreach ($g in $selectedGroups) {
-        $uc = Get-UnconvertedChildren -GroupId $g.Id | Where-Object { $_.Id -notin ($selectedGroups | ForEach-Object { $_.Id }) }
-        if ($uc.Count -gt 0) {
-            $warnings += "Group '$($g.DisplayName)' has unconverted nested children not in selection: $(($uc | ForEach-Object { $_.DisplayName }) -join ', ')"
-        }
-    }
-    if ($warnings.Count -gt 0) {
-        $wText = "WARNING: Nested group ordering issue!`n`n$($warnings -join "`n`n")`n`nMicrosoft recommends converting children before parents.`n`nContinue anyway?"
-        if ([System.Windows.Forms.MessageBox]::Show($wText, "Nested Group Warning",
-            [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning) -ne [System.Windows.Forms.DialogResult]::Yes) { return }
-    }
-
-    $sorted = $selectedGroups | Sort-Object { if ($script:NestingDepth.ContainsKey($_.Id)) { $script:NestingDepth[$_.Id] } else { 0 } }
-    $cnt    = $sorted.Count
-    $list   = ($sorted | ForEach-Object { "$($_.DisplayName) (Depth: $(if ($script:NestingDepth.ContainsKey($_.Id)) { $script:NestingDepth[$_.Id] } else { 0 }))" }) -join "`n"
-    $msg    = if ($cnt -eq 1) { "Convert group '$($sorted[0].DisplayName)' to Cloud Managed?" } else { "Convert $cnt groups to Cloud Managed? Order (bottom-up):`n$list" }
-
-    if ([System.Windows.Forms.MessageBox]::Show($msg, "Confirm", [System.Windows.Forms.MessageBoxButtons]::YesNo,
-        [System.Windows.Forms.MessageBoxIcon]::Question) -ne [System.Windows.Forms.DialogResult]::Yes) { return }
-
-    $ok = 0; $fail = 0
-    foreach ($g in $sorted) {
-        $gStatusLabel.Text = "Converting '$($g.DisplayName)'..."
-        [System.Windows.Forms.Application]::DoEvents()
-        if (Convert-GroupToCloud -Group $g) {
-            $g.IsCloudManaged = $true
-            foreach ($row in $gGrid.Rows) {
-                if ($row.Cells["ObjectId"].Value -eq $g.Id) { $row.Cells["IsCloudManaged"].Value = "True"; break }
-            }
-            $ok++
-        } else { $fail++ }
-    }
-    [System.Windows.Forms.MessageBox]::Show("Done.`n`nConverted: $ok`nFailed: $fail", "Batch Complete",
-        [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
-    $gStatusLabel.Text = "Converted: $ok  Failed: $fail"
-    Update-GroupGrid
-})
-
-$gBtnToOnPrem.Add_Click({
-    if (-not $script:PermissionOk) {
-        [System.Windows.Forms.MessageBox]::Show(
-            "Required permission 'Group-OnPremisesSyncBehavior.ReadWrite.All' is not consented.`nReconnect to Graph to grant it.",
-            "Permission Required", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
-        return
-    }
-    if ($gGrid.SelectedRows.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("Please select at least one group.", "No Selection",
-            [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
-        return
-    }
-
-    $selectedGroups = @()
-    foreach ($row in $gGrid.SelectedRows) {
-        $gid = $row.Cells["ObjectId"].Value
-        $g   = $script:AllGroups | Where-Object { $_.Id -eq $gid }
-        if ($g) { $selectedGroups += $g }
-    }
-
-    $sorted = $selectedGroups | Sort-Object { if ($script:NestingDepth.ContainsKey($_.Id)) { $script:NestingDepth[$_.Id] } else { 0 } } -Descending
-    $cnt    = $sorted.Count
-    $list   = ($sorted | ForEach-Object { "$($_.DisplayName) (Depth: $(if ($script:NestingDepth.ContainsKey($_.Id)) { $script:NestingDepth[$_.Id] } else { 0 }))" }) -join "`n"
-    $msg    = if ($cnt -eq 1) {
-        "Roll back '$($sorted[0].DisplayName)' to On-Prem?`n`nIMPORTANT: Remove cloud users from the group and remove from access packages first."
-    } else {
-        "Roll back $cnt groups to On-Prem? Order (top-down):`n$list`n`nIMPORTANT: Remove cloud users and remove from access packages first."
-    }
-
-    if ([System.Windows.Forms.MessageBox]::Show($msg, "Confirm Rollback", [System.Windows.Forms.MessageBoxButtons]::YesNo,
-        [System.Windows.Forms.MessageBoxIcon]::Question) -ne [System.Windows.Forms.DialogResult]::Yes) { return }
-
-    $ok = 0; $fail = 0
-    foreach ($g in $sorted) {
-        $gStatusLabel.Text = "Rolling back '$($g.DisplayName)'..."
-        [System.Windows.Forms.Application]::DoEvents()
-        if (Convert-GroupToOnPrem -Group $g) {
-            $g.IsCloudManaged = $false
-            foreach ($row in $gGrid.Rows) {
-                if ($row.Cells["ObjectId"].Value -eq $g.Id) { $row.Cells["IsCloudManaged"].Value = "False"; break }
-            }
-            $ok++
-        } else { $fail++ }
-    }
-    [System.Windows.Forms.MessageBox]::Show("Done.`n`nRolled back: $ok`nFailed: $fail`n`nNote: Rollback is complete after the next Connect Sync run.", "Batch Complete",
-        [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
-    $gStatusLabel.Text = "Rolled back: $ok  Failed: $fail"
-    Update-GroupGrid
-})
-
-$gBtnOpenLog2.Add_Click({
-    if (Test-Path $script:LogFile) { Start-Process notepad.exe -ArgumentList $script:LogFile }
-    else { [System.Windows.Forms.MessageBox]::Show("Log file not found yet.", "Log", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) }
-})
-
-# ==============================================================================
-# CONTACTS TAB -- GUI
-# ==============================================================================
-
-$cToolbar = New-Object System.Windows.Forms.Panel
-$cToolbar.Height    = 52
-$cToolbar.Dock      = [System.Windows.Forms.DockStyle]::Top
-$cToolbar.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#F3F3F3")
-
-$cBtnConnect    = New-StyledButton -Text "Connect to Graph"  -X 5   -Y 7 -Width 155 -Height 36 -BackHex "#0078D4" -ForeHex "#FFFFFF"
-$cBtnRefresh    = New-StyledButton -Text "Refresh"           -X 168 -Y 7 -Width 110 -Height 36 -Enabled $false
-$cBtnDisconnect = New-StyledButton -Text "Disconnect"        -X 286 -Y 7 -Width 120 -Height 36 -Enabled $false
-
-$cSearchLabel = New-Object System.Windows.Forms.Label
-$cSearchLabel.Location  = New-Object System.Drawing.Point(420, 14)
-$cSearchLabel.Size      = New-Object System.Drawing.Size(55, 22)
-$cSearchLabel.Text      = "Search:"
-$cSearchLabel.Font      = New-Object System.Drawing.Font("Segoe UI", 9)
-$cSearchLabel.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#1F1F1F")
-
-$cSearchBox = New-Object System.Windows.Forms.TextBox
-$cSearchBox.Location    = New-Object System.Drawing.Point(478, 11)
-$cSearchBox.Size        = New-Object System.Drawing.Size(240, 26)
-$cSearchBox.Font        = New-Object System.Drawing.Font("Segoe UI", 9)
-$cSearchBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
-
-$cChkHide = New-Object System.Windows.Forms.CheckBox
-$cChkHide.Location  = New-Object System.Drawing.Point(730, 14)
-$cChkHide.Size      = New-Object System.Drawing.Size(220, 24)
-$cChkHide.Text      = "Hide Converted Contacts"
-$cChkHide.Font      = New-Object System.Drawing.Font("Segoe UI", 9)
-$cChkHide.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#1F1F1F")
-
-$cToolbar.Controls.AddRange(@($cBtnConnect, $cBtnRefresh, $cBtnDisconnect, $cSearchLabel, $cSearchBox, $cChkHide))
-
-$cGrid = New-DataGrid
-$cGrid.Dock = [System.Windows.Forms.DockStyle]::Fill
-Add-DgvTextColumn $cGrid "DisplayName"          "Display Name"    28
-Add-DgvTextColumn $cGrid "Email"                "Email Address"   30
-Add-DgvTextColumn $cGrid "SyncEnabled"          "On-Prem Synced"  18
-Add-DgvTextColumn $cGrid "IsCloudManaged"       "Cloud Managed"   14
-Add-DgvTextColumn $cGrid "ObjectId"             "Object ID"       0  $false
-
-$cPaginPanel = New-Object System.Windows.Forms.Panel
-$cPaginPanel.Height    = 36
-$cPaginPanel.Dock      = [System.Windows.Forms.DockStyle]::Bottom
-$cPaginPanel.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#F3F3F3")
-
-$cBtnPrev = New-StyledButton -Text "< Previous" -X 0 -Y 1 -Width 100 -Height 28 -Enabled $false
-$cBtnPrev.Anchor = [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Bottom
-
-$cPageInfo = New-Object System.Windows.Forms.Label
-$cPageInfo.Location  = New-Object System.Drawing.Point(108, 6)
-$cPageInfo.Size      = New-Object System.Drawing.Size(700, 22)
-$cPageInfo.Text      = "No contacts loaded"
-$cPageInfo.Font      = New-Object System.Drawing.Font("Segoe UI", 9)
-$cPageInfo.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#605E5C")
-$cPageInfo.Anchor    = [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Bottom
-
-$cBtnNext = New-StyledButton -Text "Next >" -X 1006 -Y 1 -Width 100 -Height 28 -Enabled $false
-$cBtnNext.Anchor = [System.Windows.Forms.AnchorStyles]::Right -bor [System.Windows.Forms.AnchorStyles]::Bottom
-
-$cPaginPanel.Controls.AddRange(@($cBtnPrev, $cPageInfo, $cBtnNext))
-$cPaginPanel.Add_SizeChanged({
-    $w = $cPaginPanel.ClientSize.Width
-    $cBtnNext.Location  = New-Object System.Drawing.Point(($w - $cBtnNext.Width), 1)
-    $cPageInfo.Location = New-Object System.Drawing.Point(108, 6)
-    $cPageInfo.Size     = New-Object System.Drawing.Size([Math]::Max(50, $w - 108 - $cBtnNext.Width - 10), 22)
-})
-
-$cActionPanel = New-Object System.Windows.Forms.Panel
-$cActionPanel.Height    = 52
-$cActionPanel.Dock      = [System.Windows.Forms.DockStyle]::Bottom
-$cActionPanel.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#F3F3F3")
-
-$cBtnToCloud  = New-StyledButton -Text "Convert to Cloud Managed"   -X 0   -Y 4 -Width 220 -Height 40
-$cBtnToOnPrem = New-StyledButton -Text "Roll Back to On-Prem"       -X 228 -Y 4 -Width 200 -Height 40
-$cBtnOpenLog3 = New-StyledButton -Text "Open Log"                   -X 436 -Y 4 -Width 120 -Height 40
-
-$cStatusLabel = New-Object System.Windows.Forms.Label
-$cStatusLabel.Location  = New-Object System.Drawing.Point(570, 12)
-$cStatusLabel.Size      = New-Object System.Drawing.Size(530, 22)
-$cStatusLabel.Text      = "Not connected"
-$cStatusLabel.Font      = New-Object System.Drawing.Font("Segoe UI", 9)
-$cStatusLabel.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#605E5C")
-$cStatusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
-$cStatusLabel.Anchor    = [System.Windows.Forms.AnchorStyles]::Right -bor [System.Windows.Forms.AnchorStyles]::Bottom
-
-$cVersionLabel = New-Object System.Windows.Forms.Label
-$cVersionLabel.Location  = New-Object System.Drawing.Point(570, 34)
-$cVersionLabel.Size      = New-Object System.Drawing.Size(530, 18)
-$cVersionLabel.Text      = "Version $script:Version"
-$cVersionLabel.Font      = New-Object System.Drawing.Font("Segoe UI", 8)
-$cVersionLabel.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#808080")
-$cVersionLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
-$cVersionLabel.Anchor    = [System.Windows.Forms.AnchorStyles]::Right -bor [System.Windows.Forms.AnchorStyles]::Bottom
-
-$cActionPanel.Controls.AddRange(@($cBtnToCloud, $cBtnToOnPrem, $cBtnOpenLog3, $cStatusLabel, $cVersionLabel))
-$cActionPanel.Add_SizeChanged({
-    $w = $cActionPanel.ClientSize.Width
-    $cStatusLabel.Location  = New-Object System.Drawing.Point([Math]::Max(0, $w - $cStatusLabel.Width), 6)
-    $cVersionLabel.Location = New-Object System.Drawing.Point([Math]::Max(0, $w - $cVersionLabel.Width), 30)
-})
-
-# Dock order: Fill grid first, then bottom panels (action outermost, pagination above), then top toolbar.
-$tabContacts.Controls.Add($cGrid)
-$tabContacts.Controls.Add($cActionPanel)
-$tabContacts.Controls.Add($cPaginPanel)
-$tabContacts.Controls.Add($cToolbar)
-
-# ---- Contacts grid update helper ----
-function Update-ContactGrid {
-    $display = Get-FilteredData `
-        -Source                $script:AllContactsUnfiltered `
-        -SearchText            $cSearchBox.Text `
-        -HideConverted         $script:ContactsHideConverted `
-        -ConvertedPropertyName "IsCloudManaged" `
-        -EmailPropertyName     "Mail"
-
-    if ($script:ContactsSortColumn -ne "") {
-        $display = if ($script:ContactsSortDirection -eq "Ascending") {
-            $display | Sort-Object -Property $script:ContactsSortColumn
-        } else {
-            $display | Sort-Object -Property $script:ContactsSortColumn -Descending
-        }
-    }
-
-    $script:AllContacts = @($display)
-    $total      = $script:AllContacts.Count
-    $totalPages = [Math]::Ceiling($total / $script:PageSize)
-    if ($totalPages -lt 1) { $totalPages = 1 }
-    if ($script:ContactsCurrentPage -gt $totalPages) { $script:ContactsCurrentPage = $totalPages }
-    if ($script:ContactsCurrentPage -lt 1)           { $script:ContactsCurrentPage = 1 }
-
-    $startIdx = ($script:ContactsCurrentPage - 1) * $script:PageSize
-    $endIdx   = [Math]::Min($startIdx + $script:PageSize - 1, $total - 1)
-
-    $cGrid.Rows.Clear()
-    if ($total -gt 0) {
-        for ($i = $startIdx; $i -le $endIdx; $i++) {
-            $c       = $script:AllContacts[$i]
-            $synced  = if ($c.OnPremisesSyncEnabled) { "True" } else { "False" }
-            $cmVal   = if ($c.IsCloudManaged -is [string]) { $c.IsCloudManaged } elseif ($c.IsCloudManaged) { "True" } else { "False" }
-            $rowIdx  = $cGrid.Rows.Add($c.DisplayName, $c.Mail, $synced, $cmVal, $c.Id)
-
-            if ($c.IsCloudManaged -eq "N/A") {
-                $cGrid.Rows[$rowIdx].DefaultCellStyle.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#A0A0A0")
-            }
-        }
-        $cPageInfo.Text = "Page $($script:ContactsCurrentPage) of $totalPages  -  Showing $($endIdx - $startIdx + 1) of $total contacts"
-    } else {
-        $cPageInfo.Text = "No contacts to display"
-    }
-    $cBtnPrev.Enabled = ($script:ContactsCurrentPage -gt 1)
-    $cBtnNext.Enabled = ($script:ContactsCurrentPage -lt $totalPages)
-}
-
-# ---- Contacts event wiring ----
-$cBtnConnect.Add_Click({
-    $cBtnConnect.Enabled = $false
-    if (Connect-GraphSession) {
-        $ctx = Get-MgContext
-        $form.Text = "Exchange SOA Conversion Tool  -  Tenant: $($ctx.TenantId)"
-        $cBtnConnect.Text      = "Connected (Graph)"
-        $cBtnConnect.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#107C10")
-        $cBtnRefresh.Enabled    = $true
-        $cBtnDisconnect.Enabled = $true
-        $gBtnConnect.Text      = "Connected"
-        $gBtnConnect.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#107C10")
-        $gBtnConnect.Enabled   = $false
-        $gBtnRefresh.Enabled    = $true
-        $gBtnDisconnect.Enabled = $true
-        $cStatusLabel.Text = "Loading contacts..."
-        $contacts = Get-OrgContacts -StatusLabelRef $cStatusLabel
-        if ($contacts) {
-            $script:AllContactsUnfiltered = $contacts
-            $script:ContactsCurrentPage   = 1
-            Update-ContactGrid
-            $cStatusLabel.Text = "Connected  -  $($contacts.Count) contacts loaded"
-        } else { $cStatusLabel.Text = "Connected but failed to load contacts" }
-    } else {
-        $cBtnConnect.Enabled = $true
-    }
-})
-
-$cBtnRefresh.Add_Click({
-    $cBtnRefresh.Enabled = $false
-    $cStatusLabel.Text = "Refreshing..."
-    $contacts = Get-OrgContacts -StatusLabelRef $cStatusLabel
-    if ($contacts) {
-        $script:AllContactsUnfiltered = $contacts
-        $script:ContactsCurrentPage   = 1
-        Update-ContactGrid
-        $cStatusLabel.Text = "Refreshed  -  $($contacts.Count) contacts loaded"
-    }
-    $cBtnRefresh.Enabled = $true
-})
-
-$cBtnDisconnect.Add_Click({
-    try { Disconnect-MgGraph -ErrorAction Stop; Write-Log "Disconnected from Graph." }
-    catch { Write-Log "Graph disconnect warning: $($_.Exception.Message)" -Level WARNING }
-    $form.Text = "Exchange SOA Conversion Tool"
-    $cBtnConnect.Text      = "Connect to Graph"
-    $cBtnConnect.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#0078D4")
-    $cBtnConnect.Enabled   = $true
-    $cBtnRefresh.Enabled   = $false
-    $cBtnDisconnect.Enabled = $false
-    $gBtnConnect.Text      = "Connect to Graph"
-    $gBtnConnect.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#0078D4")
-    $gBtnConnect.Enabled   = $true
-    $gBtnRefresh.Enabled   = $false
-    $gBtnDisconnect.Enabled = $false
-    $script:AllGroupsUnfiltered   = @()
-    $script:AllGroups             = @()
-    $script:AllContactsUnfiltered = @()
-    $script:AllContacts           = @()
-    $script:PermissionOk          = $false
-    $gGrid.Rows.Clear(); $cGrid.Rows.Clear()
-    $gPageInfo.Text    = "No groups loaded"
-    $cPageInfo.Text    = "No contacts loaded"
-    $gStatusLabel.Text = "Disconnected"
-    $cStatusLabel.Text = "Disconnected"
-    [System.Windows.Forms.MessageBox]::Show("Disconnected from Microsoft Graph.", "Disconnected",
-        [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
-})
-
-$cSearchBox.Add_TextChanged({
-    $script:ContactsCurrentPage = 1
-    Update-ContactGrid
-})
-
-$cChkHide.Add_CheckedChanged({
-    $script:ContactsHideConverted = $cChkHide.Checked
-    $script:ContactsCurrentPage   = 1
-    Update-ContactGrid
-})
-
-$cBtnPrev.Add_Click({
-    if ($script:ContactsCurrentPage -gt 1) { $script:ContactsCurrentPage--; Update-ContactGrid }
-})
-$cBtnNext.Add_Click({
-    $tp = [Math]::Ceiling($script:AllContacts.Count / $script:PageSize)
-    if ($script:ContactsCurrentPage -lt $tp) { $script:ContactsCurrentPage++; Update-ContactGrid }
-})
-
-$cGrid.Add_ColumnHeaderMouseClick({
-    param($dgv, $e)
-    $col = $dgv.Columns[$e.ColumnIndex].Name
-    if ($col -eq "ObjectId") { return }
-    if ($script:ContactsSortColumn -eq $col) {
-        $script:ContactsSortDirection = if ($script:ContactsSortDirection -eq "Ascending") { "Descending" } else { "Ascending" }
-    } else {
-        $script:ContactsSortColumn    = $col
-        $script:ContactsSortDirection = "Ascending"
-    }
-    $script:ContactsCurrentPage = 1
-    Update-ContactGrid
-})
-
-$cBtnToCloud.Add_Click({
-    if ($cGrid.SelectedRows.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("Please select at least one contact.", "No Selection",
-            [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
-        return
-    }
-
-    $selectedContacts = @()
-    foreach ($row in $cGrid.SelectedRows) {
-        $cid = $row.Cells["ObjectId"].Value
-        $c   = $script:AllContacts | Where-Object { $_.Id -eq $cid }
-        if ($c) {
-            if ($c.OnPremisesSyncEnabled -ne $true) {
-                [System.Windows.Forms.MessageBox]::Show(
-                    "'$($c.DisplayName)' is not an on-premises synced contact (N/A).`nSOA conversion only applies to synced contacts. Skipping.",
-                    "Not Applicable", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
-                continue
-            }
-            $selectedContacts += $c
-        }
-    }
-    if ($selectedContacts.Count -eq 0) { return }
-
-    $cnt   = $selectedContacts.Count
-    $names = ($selectedContacts | ForEach-Object { $_.DisplayName }) -join ", "
-    $msg   = if ($cnt -eq 1) { "Convert contact '$names' to Cloud Managed?" } else { "Convert $cnt contacts to Cloud Managed?`n`n$names" }
-    if ([System.Windows.Forms.MessageBox]::Show($msg, "Confirm", [System.Windows.Forms.MessageBoxButtons]::YesNo,
-        [System.Windows.Forms.MessageBoxIcon]::Question) -ne [System.Windows.Forms.DialogResult]::Yes) { return }
-
-    $ok = 0; $fail = 0
-    foreach ($c in $selectedContacts) {
-        $cStatusLabel.Text = "Converting '$($c.DisplayName)'..."
-        [System.Windows.Forms.Application]::DoEvents()
-        if (Convert-ContactToCloud -Contact $c) {
-            $c.IsCloudManaged = $true
-            foreach ($row in $cGrid.Rows) {
-                if ($row.Cells["ObjectId"].Value -eq $c.Id) { $row.Cells["IsCloudManaged"].Value = "True"; break }
-            }
-            $ok++
-        } else { $fail++ }
-    }
-    [System.Windows.Forms.MessageBox]::Show("Done.`n`nConverted: $ok`nFailed: $fail", "Batch Complete",
-        [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
-    $cStatusLabel.Text = "Converted: $ok  Failed: $fail"
-    Update-ContactGrid
-})
-
-$cBtnToOnPrem.Add_Click({
-    if ($cGrid.SelectedRows.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("Please select at least one contact.", "No Selection",
-            [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
-        return
-    }
-
-    $selectedContacts = @()
-    foreach ($row in $cGrid.SelectedRows) {
-        $cid = $row.Cells["ObjectId"].Value
-        $c   = $script:AllContacts | Where-Object { $_.Id -eq $cid }
-        if ($c) {
-            if ($c.OnPremisesSyncEnabled -ne $true) {
-                [System.Windows.Forms.MessageBox]::Show(
-                    "'$($c.DisplayName)' is not an on-premises synced contact (N/A).`nSOA conversion only applies to synced contacts. Skipping.",
-                    "Not Applicable", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
-                continue
-            }
-            $selectedContacts += $c
-        }
-    }
-    if ($selectedContacts.Count -eq 0) { return }
-
-    $cnt   = $selectedContacts.Count
-    $names = ($selectedContacts | ForEach-Object { $_.DisplayName }) -join ", "
-    $msg   = if ($cnt -eq 1) { "Roll back contact '$names' to On-Prem Managed?" } else { "Roll back $cnt contacts to On-Prem Managed?`n`n$names" }
-    if ([System.Windows.Forms.MessageBox]::Show($msg, "Confirm Rollback", [System.Windows.Forms.MessageBoxButtons]::YesNo,
-        [System.Windows.Forms.MessageBoxIcon]::Question) -ne [System.Windows.Forms.DialogResult]::Yes) { return }
-
-    $ok = 0; $fail = 0
-    foreach ($c in $selectedContacts) {
-        $cStatusLabel.Text = "Rolling back '$($c.DisplayName)'..."
-        [System.Windows.Forms.Application]::DoEvents()
-        if (Convert-ContactToOnPrem -Contact $c) {
-            $c.IsCloudManaged = $false
-            foreach ($row in $cGrid.Rows) {
-                if ($row.Cells["ObjectId"].Value -eq $c.Id) { $row.Cells["IsCloudManaged"].Value = "False"; break }
-            }
-            $ok++
-        } else { $fail++ }
-    }
-    [System.Windows.Forms.MessageBox]::Show("Done.`n`nRolled back: $ok`nFailed: $fail", "Batch Complete",
-        [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
-    $cStatusLabel.Text = "Rolled back: $ok  Failed: $fail"
-    Update-ContactGrid
-})
-
-$cBtnOpenLog3.Add_Click({
-    if (Test-Path $script:LogFile) { Start-Process notepad.exe -ArgumentList $script:LogFile }
-    else { [System.Windows.Forms.MessageBox]::Show("Log file not found yet.", "Log", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) }
+    else { [void][System.Windows.Forms.MessageBox]::Show("Log file not found yet.", "Log", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) }
 })
 
 # ==============================================================================
@@ -1763,7 +901,6 @@ $cBtnOpenLog3.Add_Click({
 $form.Add_FormClosing({
     Write-Log "Exchange SOA Conversion Tool closing..."
     try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch {}
-    try { Disconnect-MgGraph -ErrorAction SilentlyContinue } catch {}
     if ($pictureBoxLogo.Image) { $pictureBoxLogo.Image.Dispose() }
     Write-Log "========================================"
     Write-Log "Exchange SOA Conversion Tool Ended"
